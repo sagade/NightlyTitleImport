@@ -1,0 +1,567 @@
+---
+title: "Analysus of the nightly title import rate"
+author: "Rene Lange"
+date: "2/19/2022"
+output: 
+  rmdformats::html_clean:
+    code_folding: hide
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: false
+    highlight: tango
+editor_options:
+  chunk_output_type: inline
+---
+
+<style type="text/css">
+.main-container {
+max-width: 1800px;
+margin-left: auto;
+margin-right: auto;
+}
+</style>
+
+## Intro
+
+The following script analyzes log data from nightly library database imports. Every 
+night a varying number of book records is imported using two processes. Lately there
+have been complaints about the duration of processes. Here, we analyze a dataset
+consisting of two log-files to answer following questions:
+
+1) Are there specific patterns or changes of the imported titles (total number, sources, etc.) over time ?
+2) What are the factors that influence the duration of the two import processes?
+
+
+The analysis will be conducted using the statistical programming language R. We
+will need a couple of packages that can be installed using the following command (from within R):
+
+```{r eval = FALSE, echo = T}
+install.packages(c("knitr", "pander", "rmarkdown", "tidyverse", 
+                   "ggExtra", "GGally", "scales", "plotly", 
+                   "lubridate", "caret", "randomForest", "doMC"))
+```
+
+Next we need to load the required packages and set some options for the analysis:
+
+```{r setup, include=FALSE}
+
+# Setup chunk: load libraries and set options for the 'knitr process' to 
+#              create a report from the code and the output
+
+
+## load libraries
+
+### libraries for the knitr process
+library(knitr)
+library(pander)
+library(rmarkdown)
+
+### meta library 'tidyverse' combining libraries for readind and wrengling of
+### data and ggplot2 the library for plotting
+library(tidyverse)
+
+### extra specialized plotting libraries needed for the pairs plot and the 
+### density on the side as well as for specialized axes for time scales
+library(ggExtra)
+library(GGally)
+library(scales)
+library(plotly)
+
+### the lubridate libray makes it easier to handle dates and time durations
+### in R
+library(lubridate)
+
+### the caret and the randomForest package are needed for the regressionn
+library(caret)
+library(randomForest)
+
+### the doMC package is the multi-core backends for training
+### the regression model
+library(doMC)
+
+## use all available cores
+## can be also given a fixed number
+registerDoMC(cores = parallel::detectCores())
+
+## set knitr options for producing the reports
+knitr::opts_chunk$set(echo = TRUE, 
+                      message = FALSE,
+                      warning = FALSE,
+                      results = 'hide',
+                      error = TRUE,
+                      dev = c("CairoPNG", "CairoPDF"),    ### create figures as both: png and pdf
+                      dpi = 300,                          ### create PNG graphics with a DPI of 300
+                      fig.path = "plots/"                 ### set sub-dir plots to store the graphics
+                      )
+
+## set default plotting theme for ggplot
+theme_set(theme_bw(15))
+
+## set english locale for english weekdays
+Sys.setlocale("LC_TIME", "en_US.UTF-8")
+
+```
+
+## Data import and wrengling
+
+At first we read the two data tables from files:
+
+- *importkontrolle_gesamt_needed_col.csv*: contains the date and the duration
+of the KUPICA and the AKKUAK process
+
+- *pica_downloader_stat.log*: contains for each day the properties of the title
+import like total number of titles and sources
+
+```{r read_data}
+data_time <- read_delim("importkontrolle_gesamt_needed_col.csv", delim = " ")
+colnames(data_time) <- c("date", "KUPICA", "AKKUAK")
+
+#Datum|Gesamt|SWB|ZDB|EZB|Online|>4000 Subfields|>40k Bytes
+data_pica <- read_delim("pica_downloader_stat.log", delim = " ", skip = 1)
+colnames(data_pica) <- c("date", "total", "SWB", "ZDB", "EZB", "Online", ">4000 Subfields", ">40kB")
+
+```
+
+
+The duration of the two processes KUPICA and AKKUAK are given in the table in a format
+HH:MM. This is interpreted as time-stamp in R. For a better hanling we will transform
+that to a time duration:
+
+
+```{r}
+
+data_time <- data_time %>% 
+  mutate(KUPICA = as.duration(KUPICA),
+         AKKUAK = as.duration(AKKUAK))
+
+```
+
+
+Before we merge the two tables, we perform some checks to see if the dates are
+really unique::
+
+```{r tests, results='markup'}
+
+nrow(data_time)
+length(unique(data_time$date))
+
+nrow(data_pica)
+length(unique(data_pica$date))
+
+dat_dup <- data_pica$date[duplicated(data_pica$date)]
+print(dat_dup)
+
+```
+Indeed, there are 4 duplicated dates in the second table (`data_pica`) Theses
+need to be removed prior the actual analysis. We will use only entries with the highest number
+of total titles imported each day:
+
+```{r remove_duplicates}
+
+data_pica <- data_pica %>% 
+  group_by(date) %>% 
+  slice(which.max(total)) %>% 
+  ungroup()
+
+```
+
+Now we have one line per date in each table and can use the date as primary key
+to join the two tables:
+
+```{r}
+data <- data_pica %>% 
+  dplyr::full_join(data_time, by = c("date"))
+```
+
+For convenience we calculate day, month and year form the date:
+
+```{r}
+data <- data %>% 
+  mutate(weekday = wday(date, label = T, week_start = 1),
+         month = month(date, label = T),
+         year = factor(year(date)))
+```
+
+The final data table looks like this
+
+```{r results='asis'}
+kable(head(data))
+```
+
+
+and contains `r nrow(data)` entries. Please note, that we only have duration
+data of the two processes from `r sum(is.finite(data$KUPICA) & is.finite(data$AKKUAK))` days.
+
+## Title imports over time
+
+To answer the first question, we will visualize the number of titles over time
+and look for 
+
+```{r total, fig.width=3, fig.height=5, out.width="30%"}
+
+data %>% 
+  ggplot(aes(x = factor(1), y = total)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  xlab("") + 
+  ylab("total number of title imports")
+
+data %>% 
+  ggplot(aes(x = factor(1), y = total)) +
+  geom_violin(color = "blue") +
+  geom_jitter(position = position_jitter(height = 0, width = 0.1), alpha = 0.5) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  xlab("") +
+  ylab("total number of title imports")
+
+
+```
+
+
+```{r date_total, fig.width=17, fig.height=7}
+
+data %>% 
+  ggplot(aes(x = date, y = total)) +
+  geom_point() +
+  geom_smooth() +
+  geom_smooth(method = "lm", color = "red") +
+  ylab("total number of title imports")
+
+data %>% 
+  ggplot(aes(x = date, y = total, color = weekday)) +
+  geom_point() +
+  facet_wrap(~weekday) +
+  geom_smooth() +
+  guides(color = "none") +
+  ylab("total number of title imports")
+
+data %>% 
+  ggplot(aes(x = date, y = total, color = month)) +
+  geom_point() +
+  facet_wrap(~month) +
+  guides(color = "none") +
+  ylab("total number of title imports")
+
+data %>% 
+  mutate(year = factor(year(date), ordered = T)) %>% 
+  ggplot(aes(x = date, y = total, color = year, group = year)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  # guides(color = "none") +
+  ylab("total number of title imports")
+
+data %>% 
+  mutate(year = factor(year(date), ordered = T)) %>% 
+  ggplot(aes(x = date, y = total, color = year, group = year)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y~1) +
+  # guides(color = "none") +
+  ylab("total number of title imports")
+
+data %>% 
+  ggplot(aes(x = date, y = total, color = KUPICA)) +
+  geom_point() +
+  geom_smooth() +
+  ylab("total number of title imports")
+
+data %>% 
+  ggplot(aes(x = date, y = total, color = AKKUAK)) +
+  geom_point() +
+  geom_smooth() +
+  ylab("total number of title imports")
+  
+
+```
+
+A more interactive graph can be produced using the `plotly` package:
+
+```{r total_date_interactive, results='asis', fig.width=17, fig.height=7}
+
+pl <- data %>% 
+  ggplot(aes(x = date, y = total)) +
+  geom_point() +
+  geom_smooth() +
+  geom_smooth(method = "lm", color = "red") +
+  ylab("total number of title imports")
+
+ggplotly(pl)
+```
+
+We can also have a look on the sources and if the composition of these changes
+over time
+
+```{r source_composition, fig.width=17}
+
+data %>% 
+  pivot_longer(cols = c(SWB, ZDB, EZB, Online), names_to = "source", values_to = "number_titles") %>% 
+  group_by(date) %>% 
+  mutate(ratio = number_titles / sum(number_titles)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = date, y = ratio, color = source, group = source)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth() +
+  scale_y_continuous(labels=scales::percent) +
+  scale_color_brewer(palette = "Dark2") +
+  ylab("proportion of each source of total title imports")
+
+data %>% 
+  pivot_longer(cols = c(SWB, ZDB, EZB, Online), names_to = "source", values_to = "number_titles") %>% 
+  group_by(date) %>% 
+  mutate(ratio = number_titles / sum(number_titles)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = date, y = ratio, color = source, group = source)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth() +
+  facet_wrap(~weekday) +
+  scale_y_continuous(labels=scales::percent) +
+  scale_color_brewer(palette = "Dark2") +
+  ylab("proportion of each source of total title imports")
+
+```
+
+
+## Process duration
+
+Now, we want to answer the second question. What are factors influencing the 
+duration of the two import processes. 
+
+```{r process_duration_date, fig.width=17, fig.height=7}
+
+data %>% 
+  pivot_longer(c(KUPICA, AKKUAK), names_to = "key", values_to = "val") %>% 
+  filter(is.finite(val)) %>% 
+  ggplot(aes(x = date, y = val, color = key)) +
+  geom_point() +
+  facet_wrap(~key, ncol = 1) +
+  geom_smooth() +
+  ylab("process duration") +
+  scale_y_time() +
+  scale_color_manual("", values = c("darkred", "navyblue")) +
+  guides(color = "none")
+
+data %>% 
+  pivot_longer(c(KUPICA, AKKUAK), names_to = "key", values_to = "val") %>% 
+  filter(is.finite(val)) %>% 
+  ggplot(aes(x = date, y = val, color = weekday)) +
+  geom_point() +
+  facet_grid(key~weekday) +
+  geom_smooth() +
+  ylab("process duration") +
+  scale_y_time() +
+  guides(color = "none") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+```
+
+
+Although the data for the two import processes are quite sparse, there doesn't seem to be
+a trend or changes of the process duration over time. Next, we have a look on the correlations
+of all factors we have in the dataset to identify possible causal relations of factors
+to the runtime of the import processes:
+
+```{r correlations, fig.width=17, fig.height=14}
+
+pl <- data %>% 
+  select(KUPICA, AKKUAK, total, SWB, EZB, ZDB, Online, `>4000 Subfields`, `>40kB`) %>% 
+  ggpairs() + theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+pl
+
+```
+
+
+The total number of imported titles has the highest correlation to the
+duration of the two processes. We can also plot this relation dependent on the 
+weekday:
+
+```{r total_vs_dur, fig.width=16, fig.height=8}
+data %>% 
+  select(date, weekday, total, KUPICA, AKKUAK) %>% 
+  pivot_longer(cols = c(KUPICA, AKKUAK), names_to = "key", values_to = "val") %>% 
+  ggplot(aes(x = total, y = val, color = weekday)) +
+  geom_point() +
+  facet_grid(key ~ weekday) +
+  geom_smooth(method = "lm") +
+  scale_y_time() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylab("duration of processes") + xlab("total number of title imports")
+```
+
+Since the total number of imported titles seems to be the most important driver
+for process duration, we have a look on the import time per title:
+
+
+```{r}
+
+data_plot <- data %>% 
+  select(date, weekday, total, KUPICA, AKKUAK) %>% 
+  pivot_longer(cols = c(KUPICA, AKKUAK), names_to = "key", values_to = "val") %>% 
+  mutate(dur_per_title = val / total) %>% 
+  filter(is.finite(dur_per_title))
+
+pl <- data_plot %>% 
+  ggplot(aes(x = date, y = dur_per_title, color = key)) +
+  geom_point() +
+  facet_wrap(~key, ncol = 1) +
+  geom_smooth() +
+  ylab("duration per title in seconds") +
+  scale_color_brewer("", palette = "Dark2") +
+  guides(color = "none") +
+  scale_y_log10()
+
+pl <- pl + 
+  geom_label(data = data_plot %>% filter(dur_per_title > 10), 
+             aes(label = date), nudge_x = 40)
+
+print(pl)
+
+
+```
+There seems to be some outliers: for example at December 13, 2020 it took over 16 minutes
+to import one title for the AKUAK process.
+
+The next two factors we can check are the number of titles with more than 4k subfields and
+the number of titles with a dataset larger than 40 kilo-bytes:
+
+```{r subfields}
+
+data %>% 
+  select(date, weekday, `>4000 Subfields`, total, KUPICA, AKKUAK) %>% 
+  pivot_longer(cols = c(KUPICA, AKKUAK), names_to = "key", values_to = "val") %>% 
+  mutate(dur_per = val / total) %>% 
+  ggplot(aes(x = `>4000 Subfields`, y = dur_per)) +
+  geom_point(aes(color = weekday)) +
+  facet_grid(~ key) +
+  scale_y_log10() +
+  ylab("duration per title in seconds")
+
+```
+
+```{r 40kB_size}
+
+data %>% 
+  select(date, weekday, `>40kB`, total, KUPICA, AKKUAK) %>% 
+  pivot_longer(cols = c(KUPICA, AKKUAK), names_to = "key", values_to = "val") %>% 
+  mutate(dur_per = val / total) %>% 
+  ggplot(aes(x = `>40kB`, y = dur_per)) +
+  geom_point(aes(color = weekday)) +
+  facet_grid(~ key) +
+  scale_y_log10() +
+  ylab("duration per title in seconds")
+
+data %>% 
+  select(date, weekday, `>40kB`, total, KUPICA, AKKUAK) %>% 
+  pivot_longer(cols = c(KUPICA, AKKUAK), names_to = "key", values_to = "val") %>% 
+  mutate(dur_per = val / total) %>% 
+  ggplot(aes(x = dur_per)) +
+  geom_density() +
+  facet_grid(~ key) +
+  xlim(c(0, 10))
+```
+
+```{r 40kB_size_marginal_hist}
+pl <- data %>% 
+  select(date, weekday, `>40kB`, total, KUPICA, AKKUAK) %>% 
+  pivot_longer(cols = c(KUPICA, AKKUAK), names_to = "key", values_to = "val") %>% 
+  mutate(dur_per = val / total) %>% 
+  ggplot(aes(x = `>40kB`, y = dur_per, color = key)) +
+  geom_point() +
+  scale_y_log10() +
+  theme(legend.position = "bottom") +
+  ylab("duration per title in seconds") + xlab("No. of titles with size >40kB")
+ggExtra::ggMarginal(pl, type = "histogram")
+```
+
+
+### Predict process duration from log data
+
+In a last step we try to predict the duration of the two import processes using
+the other factors in our dataset. We will use a random Forest regression model and try to predict the duration of the KUPICA and AKKUAK process (duration in seconds). Then we will have a look on the variable importance to assess what factors are relevant to predict
+the import process duration.
+
+```{r train_data}
+data_train <- data %>% 
+  filter(!is.na(KUPICA), !is.na(AKKUAK)) %>% 
+  mutate(KUPICA = as.numeric(KUPICA),
+         AKKUAK = as.numeric(AKKUAK)) %>% 
+  mutate(month = month(date),
+         month = factor(month)) %>% 
+  select(KUPICA, AKKUAK, weekday, month, total, EZB, ZDB, SWB, Online,`>4000 Subfields`, `>40kB`)
+
+
+fitControl <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           ## repeated ten times
+                           repeats = 10)
+```
+
+
+```{r caret_rf_kupica}
+
+set.seed(1234)
+
+rf_fit <- train(KUPICA~., data = data_train, method = "rf", trControl = fitControl)
+  
+var_imp <- varImp(rf_fit)$importance
+pl <- tibble(variable = rownames(var_imp),
+             importance = var_imp[,1]) %>% 
+  arrange(importance) %>% 
+  mutate(variable = factor(variable, levels = unique(variable))) %>% 
+  ggplot(aes(y = importance, x = variable)) +
+  geom_bar(aes(fill = importance), stat = "identity") +
+  coord_flip() +
+  xlab("") + ylab("importance for predicting KUPICA duration")
+pl
+
+```
+
+
+```{r caret_rf_akkuake}
+
+set.seed(46592)
+
+rf_fit <- train(AKKUAK~., data = data_train, method = "rf", trControl = fitControl)
+  
+var_imp <- varImp(rf_fit)$importance
+pl <- tibble(variable = rownames(var_imp),
+             importance = var_imp[,1]) %>% 
+  arrange(importance) %>% 
+  mutate(variable = factor(variable, levels = unique(variable))) %>% 
+  ggplot(aes(y = importance, x = variable)) +
+  geom_bar(aes(fill = importance), stat = "identity") +
+  coord_flip() +
+  xlab("") + ylab("importance for predicting AKKUAK duration")
+pl
+
+```
+
+## Conclusion
+
+1) The total number of imports increased over the last years with a peak beginning of
+2021. There is no obvious difference between weekdays or months but the composition (title sources) varies over time (the peak can be explained with a rise of online titles).
+
+2) The duration of the two import processes correlates with each other and the total number of titles imported. Consequently the duration per title stays relatively constant
+except for a couple of extreme outliers. Nevertheless, the total number of titles
+imported seems to be the predominant factor to determine the import process duration. There are no clear correlations with the number of large title records or records with 
+a large number of subfields. This is confirmed by the Random Forest regression which
+showed the total number of titles as most important variable in the model.
+
+
+## Appendix
+
+The merged and cleaned data are exported to a tab separated text files 
+`Nightly_title_import_cleaned_merged.tsv`.
+
+```{r}
+write_tsv(data, "Nightly_title_import_cleaned_merged.tsv")
+```
+
+The analysis was conducted using following R and package versions:
+
+```{r results='asis'}
+pander(sessionInfo())
+```
+
